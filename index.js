@@ -32,6 +32,7 @@ let database = null;
 let imageCache = new Map();
 let currentImages = [];
 let currentImgIdx = -1;
+let wikiImages = [];
 
 // Utility functions
 const $ = (id) => document.getElementById(id);
@@ -44,13 +45,19 @@ cursorEl.style.opacity = '0.5';
 cursorEl.style.pointerEvents = 'none';
 document.body.appendChild(cursorEl);
 
-function showLoading() {
-  $('loading').style.display = 'flex';
+function showLoading(message = 'Processing...') {
+  const loadingEl = $('loading');
+  const loadingText = $('loadingText');
+  if (loadingText) loadingText.textContent = message;
+  if (loadingEl) loadingEl.style.display = 'flex';
   document.body.style.cursor = 'wait';
 }
 
 function hideLoading() {
-  $('loading').style.display = 'none';
+  const loadingEl = $('loading');
+  const loadingText = $('loadingText');
+  if (loadingText) loadingText.textContent = '';
+  if (loadingEl) loadingEl.style.display = 'none';
   document.body.style.cursor = 'default';
 }
 
@@ -156,12 +163,6 @@ function renderTimeline() {
 
   if (currentImages.length === 0) {
     console.log('No images, showing upload interface'); // Debug log
-    timeline.innerHTML = `
-      <div class="upload-next">
-        <input type="file" id="imageInput" accept="image/*" style="display: none;">
-        <button id="uploadTrigger" class="upload-plus">+</button>
-      </div>
-    `;
   } else {
     const timelineImgs = currentImages
       .map(
@@ -170,27 +171,16 @@ function renderTimeline() {
       <div class="image-item" data-index="${index}">
         <img src="${img.dataURL}" alt="Image ${index + 1}" loading="lazy">
         <div class="image-info">
-          ${Math.floor(new Date(img.timestamp).getTime() / 1000).toString()}
+       ${img.title} ${index !== currentImages.length - 1 ? '->' : ''}
         </div>
       </div>
     `,
       )
       .join('');
 
-    // Add upload interface after all images
-    const uploadInterface = `
-      <div class="upload-next" id="uploadTrigger">
-        <input type="file" id="imageInput" accept="image/*" style="display: none;">
-        <button class="upload-plus">+</button>
-      </div>
-    `;
-
     // Use innerHTML to set all content at once (images + upload interface)
-    timeline.innerHTML = timelineImgs + uploadInterface;
+    timeline.innerHTML = timelineImgs;
   }
-
-  // Re-attach event listeners after DOM update
-  attachUploadListeners();
 
   // Logic to click the image and open in #viewer
   const imageItems = document.querySelectorAll('.image-item');
@@ -227,57 +217,14 @@ function renderImageInViewer(imgData) {
     bbox.style.top = p.y + '%';
     bbox.style.width = p.width + '%';
     bbox.style.height = p.height + '%';
+    bbox.style.opacity = '0.9';
+    bbox.style.backdropFilter = 'blur(4px)';
   } else {
     bbox.style.display = 'none'; // no placement, hide bbox
   }
 
   // reset zoom
   img.style.transform = 'scale(1)';
-}
-
-// Function to attach upload listeners (since DOM elements are recreated)
-function attachUploadListeners() {
-  const uploadTrigger = document.getElementById('uploadTrigger');
-  const fileInput = document.getElementById('imageInput');
-
-  if (uploadTrigger && fileInput) {
-    // Click + button triggers file input
-    uploadTrigger.addEventListener('click', (e) => {
-      if (!database) {
-        showStatus('Firebase not initialized', 'error');
-        return;
-      }
-
-      fileInput.click();
-    });
-
-    // When file is selected, automatically upload
-    fileInput.addEventListener('change', (e) => {
-      if (e.target.files[0]) {
-        // show the image inside the uploadTrigger div with opacity
-        const file = e.target.files[0];
-        const imgPreview = document.createElement('img');
-        imgPreview.src = URL.createObjectURL(file);
-        imgPreview.style.width = '100%';
-        imgPreview.style.height = '100%';
-        imgPreview.style.objectFit = 'contain';
-        imgPreview.style.opacity = 0.5;
-        imgPreview.style.position = 'absolute';
-        imgPreview.style.top = 0;
-        imgPreview.style.left = 0;
-        imgPreview.style.zIndex = 10;
-        uploadTrigger.appendChild(imgPreview);
-
-        // upload to replicate, then firebase
-        handleImageUpload();
-      }
-    });
-  } else {
-    console.error('Failed to find upload elements:', {
-      uploadTrigger,
-      fileInput,
-    });
-  }
 }
 
 // Call Replicate model
@@ -304,11 +251,6 @@ async function callReplicateModel(token, modelVersion, inputObj) {
 
 // Process image with Seedream-4
 async function processWithSeedream(token, newImageDataURL, lastImageDataURL) {
-  console.log('Image URLs for Seedream:', {
-    newImageDataURL,
-    lastImageDataURL,
-  });
-
   const input = {
     size: '2K',
     width: 2048,
@@ -344,24 +286,9 @@ async function saveImageToDatabase(imageData) {
 }
 
 // Main upload handler
-async function handleImageUpload() {
-  const fileInput = $('imageInput');
-  const file = fileInput.files[0];
-
-  if (!file) {
-    showStatus('Please select an image first', 'error');
-    return;
-  }
-
-  // Validate file type
-  if (!file.type.startsWith('image/')) {
-    showStatus('Please select a valid image file', 'error');
-    return;
-  }
-
-  // Validate file size (max 5MB for base64 storage)
-  if (file.size > 5 * 1024 * 1024) {
-    showStatus('Image too large. Please select an image under 5MB.', 'error');
+async function handleImageUpload(currImg, objectToSearch) {
+  console.log('🎊 uploading image for ', currImg, objectToSearch);
+  if (!currImg) {
     return;
   }
 
@@ -380,23 +307,29 @@ async function handleImageUpload() {
   let isGenerated;
   let originalDataURL;
   let placement;
+  let objectToSearchURL;
 
   try {
-    showLoading();
+    // show which image is being processed (use filename if available)
+    const displayName = currImg.title || currImg.url;
+    showLoading(`Processing: ${displayName}`);
     showStatus('Processing image...', 'success');
 
     const timestamp = new Date().toISOString();
 
     // Convert file to base64 data URL
-    console.log('Converting image to base64...');
-    originalDataURL = await fileToDataURL(file);
+    console.log('Converting image to base64...', currImg, objectToSearch);
+    originalDataURL = await imageUrlToBase64(currImg.url);
+    if (objectToSearch)
+      objectToSearchURL = await imageUrlToBase64(objectToSearch.url);
+
     console.log('Base64 conversion complete');
 
     finalDataURL = originalDataURL;
     isGenerated = false;
 
-    // If this is not the first image, process with Seedream-4
-    if (currentImages.length > 0) {
+    // If this is not the first image and , process with Seedream-4
+    if (currentImages.length > 0 && objectToSearchURL) {
       const lastImage = currentImages[currentImages.length - 1];
       console.log('Processing with Seedream-4...');
 
@@ -421,18 +354,10 @@ async function handleImageUpload() {
         // STEP 3: analyze image difference to find the new object estimated location / bbox
         placement = await analyzeImagePlacement(
           token,
-          lastImage.dataURL,
           finalDataURL,
-          originalDataURL,
+          objectToSearchURL,
         );
         console.log('🎆 Image placement analysis:', placement);
-
-        // STEP 4: put the image on the viewer with bbox
-        // if (placement) {
-        //   drawBBox(finalDataURL, placement);
-        // } else {
-        //   console.warn('No placement data received, skipping bbox drawing');
-        // }
 
         // break workflow if no final data URL of converted image found and the db already have images
         if (!finalDataURL && currentImages.length !== 0) return;
@@ -448,15 +373,15 @@ async function handleImageUpload() {
     // STEP 5: Save to database
     const imageData = {
       idx: currentImages.length === 0 ? 0 : currentImages.length,
+      title: currImg.title,
       dataURL: finalDataURL,
       originalDataURL: originalDataURL,
+      wikiDataUrl: objectToSearchURL || null,
       placement: placement || null,
       timestamp: timestamp,
       isGenerated: isGenerated,
       width: 2048,
       height: 2048,
-      filename: file.name,
-      fileSize: file.size,
     };
 
     console.log('Saving to database...');
@@ -475,9 +400,6 @@ async function handleImageUpload() {
     // Re-render timeline
     renderTimeline();
 
-    // Clear input
-    fileInput.value = '';
-
     hideLoading();
   } catch (error) {
     console.error('Upload error:', error);
@@ -488,21 +410,15 @@ async function handleImageUpload() {
 
 // STEP 3: analyze image difference to find the new object estimated location / bbox
 // Function to analyze image placement using GPT-4V
-async function analyzeImagePlacement(
-  token,
-  beforeImageDataURL,
-  afterImageDataURL,
-  originalImageDataURL,
-) {
+async function analyzeImagePlacement(token, afterImageDataURL, objectToSearch) {
   console.log('🔍 Starting image placement analysis...');
 
   const prompt = `
       I have 3 images:
-    1. BEFORE or the first image in the image_input array: The original composite image
-    2. AFTER or the second image in the image_input array: The result after inserting the new image into the original
-    3. THE SUBMITTED IMAGE INPUT or the third image in the image_input array:  a new image that was added with an object to be inserted into the BEFORE image in order to generate the AFTER image.
+    1. AFTER or the second image in the image_input array: The result after inserting the new image into the original composite image.
+    2. The object to be searched that was submitted from wikipedia result prior to the current image generation.
 
-    Please analyze where the objects in the new image was placed in the final result. Return ONLY a JSON object with the bounding box coordinates as percentages (0-100) of the image dimensions:
+    Please analyze where the object to be searched (which is the second image in the image_input array) is at within the AFTER image (which is the first image in the image_input array). Return ONLY a JSON object with the bounding box coordinates as percentages (0-100) of the image dimensions:
 
     {
       "placement": {
@@ -528,11 +444,7 @@ async function analyzeImagePlacement(
         model: 'openai/gpt-5',
         input: {
           prompt: prompt,
-          image_input: [
-            beforeImageDataURL,
-            afterImageDataURL,
-            originalImageDataURL,
-          ],
+          image_input: [afterImageDataURL, objectToSearch],
         },
       }),
     });
@@ -625,42 +537,45 @@ async function analyzeImagePlacement(
   }
 }
 
-// Zoom handling
-let virtualScroll = 0; // your "scroll position"
+// Zoom + scroll image navigation
+let virtualScroll = 0;
+
 window.addEventListener(
   'wheel',
   (e) => {
     e.preventDefault(); // prevent default scrolling
 
     if (currentImgIdx < 0 || currentImgIdx >= currentImages.length) return;
-
-    // deltaY tells you the scroll direction and amount
-    virtualScroll += e.deltaY;
-
-    // optional: clamp to a min/max
-    virtualScroll = Math.max(0, virtualScroll);
-
-    // zoom on image!
     if (!currentImages[currentImgIdx].placement) return;
 
-    img.style.transform = `scale(${1 + virtualScroll * 0.001})`;
+    // accumulate delta
+    virtualScroll += e.deltaY;
+
+    // --- zoom (always applied) ---
+    img.style.transform = `scale(${1 + Math.max(0, virtualScroll) * 0.001})`;
     img.style.transformOrigin =
       currentImages[currentImgIdx].placement.centerX +
       '% ' +
       currentImages[currentImgIdx].placement.centerY +
       '%';
 
-    // if user delta scroll reached a certain threshold, move the img src to the prev img
-    let prevImg = currentImages[currentImgIdx - 1];
-
-    if (prevImg === undefined || prevImg.idx < 0) return;
-
-    if (Math.abs(e.deltaY) > 100) {
-      // move to prev img
-      img.src = prevImg.dataURL;
-      // reset scale
+    // --- navigation (only when threshold reached) ---
+    if (virtualScroll < -100) {
+      // scroll down → next image
+      if (currentImgIdx < currentImages.length - 1) {
+        currentImgIdx++;
+        img.src = currentImages[currentImgIdx].dataURL;
+      }
+      virtualScroll = 0; // reset after changing image
       img.style.transform = 'scale(1)';
-      virtualScroll = 0;
+    } else if (virtualScroll > 400) {
+      // scroll up → previous image
+      if (currentImgIdx > 0) {
+        currentImgIdx--;
+        img.src = currentImages[currentImgIdx].dataURL;
+      }
+      virtualScroll = 0; // reset after changing image
+      img.style.transform = 'scale(1)';
     }
   },
   { passive: false },
@@ -723,8 +638,125 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
-  // Remove the old upload button and file input handlers since they're now in attachUploadListeners()
-
   // Initial render
   renderTokenStatus();
 });
+
+// WIKIPEDIA
+// WIKIPEDIA BACKLINKS
+async function fetchWikimediaImagesWithBacklinks(
+  keyword,
+  maxDepth = 3, // limit the number of recursion
+  visited = new Set(),
+) {
+  if (!keyword) return;
+  // visited.add(keyword); // todo: check visited to avoid cycles
+
+  // Step 1: Get the first image from the main page
+  console.log('Fetching image for pageeeee:', keyword);
+  await fetchFirstImageFromPage(keyword);
+
+  // Step 2: Get backlinks for this page
+  const backlinksUrl = `https://en.wikipedia.org/w/api.php?origin=*&action=query&list=backlinks&bltitle=${encodeURIComponent(
+    keyword,
+  )}&bllimit=1&format=json`;
+
+  try {
+    const resp = await fetch(backlinksUrl);
+    const data = await resp.json();
+    const backlink = data.query?.backlinks[0] || null; // take the first backlink
+
+    if (wikiImages.length > maxDepth) return;
+    const title = backlink?.title || null;
+    if (title) {
+      // recursively fetch images from backlinks
+      await fetchWikimediaImagesWithBacklinks(title);
+    }
+  } catch (err) {
+    console.error('Error fetching backlinks for', keyword, err);
+  }
+}
+
+// Helper: fetch the first valid image from a Wikipedia page
+async function fetchFirstImageFromPage(pageTitle) {
+  console.log('Fetching first image for page:', pageTitle);
+
+  const imagesUrl = `https://en.wikipedia.org/w/api.php?origin=*&action=query&titles=${encodeURIComponent(
+    pageTitle,
+  )}&prop=images&format=json`;
+
+  try {
+    const imagesResp = await fetch(imagesUrl);
+    const imagesData = await imagesResp.json();
+    const pages = Object.values(imagesData.query.pages);
+    if (!pages.length || !pages[0].images) return;
+
+    // Loop through all images until we find a usable one
+    for (const img of pages[0].images) {
+      const infoUrl = `https://en.wikipedia.org/w/api.php?origin=*&action=query&titles=${encodeURIComponent(
+        img.title,
+      )}&prop=imageinfo&iiprop=url&format=json`;
+
+      try {
+        const resp = await fetch(infoUrl);
+        const data = await resp.json();
+        const imgPages = Object.values(data.query.pages);
+        const imageUrl = imgPages[0]?.imageinfo?.[0]?.url;
+
+        if (imageUrl && imageUrl.match(/\.(jpg|jpeg|png|gif|bmp|webp)$/i)) {
+          wikiImages.push({
+            title: pageTitle,
+            url: imageUrl,
+          });
+          console.log('Found image:', imageUrl);
+          break; // Stop after first usable image
+        }
+      } catch (err) {
+        console.warn('Failed to get image info for', img.title, err);
+      }
+    }
+  } catch (err) {
+    console.warn('Failed to get images from page', pageTitle, err);
+  }
+}
+
+// Example usage with a search input
+const searchInput = document.getElementById('searchKeyword');
+const searchBtn = document.getElementById('searchBtn');
+const resultImg = document.getElementById('resultImage');
+
+searchBtn.addEventListener('click', async () => {
+  let keyword = searchInput.value.trim();
+  if (!keyword) return;
+
+  // clear old data first
+  await set(ref(database, 'images'), null);
+  wikiImages = [];
+  currentImages = [];
+
+  // GET ALL RECURSED BACKLINKS
+  await fetchWikimediaImagesWithBacklinks(keyword); // this fn saves the result to wikiImages global var
+
+  if (wikiImages.length > 0) {
+    // PROCESS IMAGES from the BACKLINKS
+    for (let i = 0; i < wikiImages.length; i++) {
+      const prevImg = i === 0 ? null : wikiImages[i - 1];
+      const currImg = wikiImages[i];
+
+      await handleImageUpload(currImg, prevImg);
+    }
+  }
+});
+
+// UTILS
+async function imageUrlToBase64(url) {
+  const response = await fetch(url);
+  const blob = await response.blob();
+
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onloadend = () => resolve(reader.result); // returns base64 string
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
+}
