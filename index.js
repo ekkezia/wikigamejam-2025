@@ -80,8 +80,7 @@ function maskToken(token) {
 function renderTokenStatus() {
   const token = localStorage.getItem(TOKEN_KEY);
   const el = $('tokenStatus');
-  if (el)
-    el.textContent = token ? `Saved: ${maskToken(token)}` : 'No token saved';
+  if (el) el.textContent = token ? `🔗 ${maskToken(token)}` : '⛓️‍💥';
 }
 
 // Convert file to base64 data URL
@@ -159,7 +158,6 @@ async function loadTimeline() {
 // Render timeline UI
 function renderTimeline() {
   const timeline = $('timeline');
-  console.log('Timeline element:', timeline); // Debug log
 
   if (currentImages.length === 0) {
     console.log('No images, showing upload interface'); // Debug log
@@ -171,7 +169,15 @@ function renderTimeline() {
       <div class="image-item" data-index="${index}">
         <img src="${img.dataURL}" alt="Image ${index + 1}" loading="lazy">
         <div class="image-info">
-       ${img.title} ${index !== currentImages.length - 1 ? '->' : ''}
+          ${
+            img.articleUrl
+              ? `<a href="https://en.wikipedia.org/?curid=${
+                  img.articleUrl
+                }" target="_blank">
+                  ${img.title} ${index !== currentImages.length - 1 ? '->' : ''}
+                </a>`
+              : `${img.title} ->`
+          }
         </div>
       </div>
     `,
@@ -197,12 +203,30 @@ function renderTimeline() {
       }
     });
   });
+
+  // Logic for mouseover for scrubbing
+  imageItems.forEach((item) => {
+    item.addEventListener('mouseover', () => {
+      const index = item.getAttribute('data-index');
+      const imgData = currentImages[index];
+      if (imgData) {
+        // update the currentImgIdx
+        currentImgIdx = imgData.idx;
+        console.log('🔔 Hovered image index:', currentImgIdx);
+
+        renderImageInViewer(imgData);
+      }
+    });
+  });
 }
 
 // #viewer div render function
 const img = $('mainImage');
 const bbox = $('bbox');
 function renderImageInViewer(imgData) {
+  // display img
+  img.style.display = 'block';
+
   // load image
   img.src = imgData.dataURL;
 
@@ -218,7 +242,7 @@ function renderImageInViewer(imgData) {
     bbox.style.width = p.width + '%';
     bbox.style.height = p.height + '%';
     bbox.style.opacity = '0.9';
-    bbox.style.backdropFilter = 'blur(4px)';
+    // bbox.style.backdropFilter = 'blur(4px)';
   } else {
     bbox.style.display = 'none'; // no placement, hide bbox
   }
@@ -256,7 +280,7 @@ async function processWithSeedream(token, newImageDataURL, lastImageDataURL) {
     width: 2048,
     height: 2048,
     prompt:
-      "insert seamlessly the second image within or inside the first image. you're free to put it anywhere and as part of any object that makes most sense with the environment of the first image.",
+      'Insert seamlessly the first image inside the second image by placing it in a way that is seamless to the environment. However, try not to make the second object be overlapping the first object and so on.',
     max_images: 4,
     image_input: [lastImageDataURL, newImageDataURL],
     aspect_ratio: '4:3',
@@ -312,7 +336,7 @@ async function handleImageUpload(currImg, objectToSearch) {
   try {
     // show which image is being processed (use filename if available)
     const displayName = currImg.title || currImg.url;
-    showLoading(`Processing: ${displayName}`);
+    showLoading(`Linking to... ${displayName}`);
     showStatus('Processing image...', 'success');
 
     const timestamp = new Date().toISOString();
@@ -328,6 +352,7 @@ async function handleImageUpload(currImg, objectToSearch) {
     finalDataURL = originalDataURL;
     isGenerated = false;
 
+    //////////////////////////////////////////////////////////////
     // If this is not the first image and , process with Seedream-4
     if (currentImages.length > 0 && objectToSearchURL) {
       const lastImage = currentImages[currentImages.length - 1];
@@ -343,6 +368,10 @@ async function handleImageUpload(currImg, objectToSearch) {
           originalDataURL,
           lastImage.dataURL,
         );
+
+        // render original data url and last image url as image on frontend cuz i wanna check if the generated image is correct
+        // create the img element
+        console.log('imageee', originalDataURL, lastImage);
 
         // Convert the generated URL back to base64 for storage
         console.log('Converting generated image to base64...');
@@ -370,10 +399,13 @@ async function handleImageUpload(currImg, objectToSearch) {
       }
     }
 
+    // can skip here if its first image
+
     // STEP 5: Save to database
     const imageData = {
       idx: currentImages.length === 0 ? 0 : currentImages.length,
       title: currImg.title,
+      articleUrl: currImg.articleId || null,
       dataURL: finalDataURL,
       originalDataURL: originalDataURL,
       wikiDataUrl: objectToSearchURL || null,
@@ -384,7 +416,7 @@ async function handleImageUpload(currImg, objectToSearch) {
       height: 2048,
     };
 
-    console.log('Saving to database...');
+    console.log('Saving to database...', imageData);
     showStatus('Saving to database...', 'success');
 
     await saveImageToDatabase(imageData);
@@ -395,6 +427,8 @@ async function handleImageUpload(currImg, objectToSearch) {
       ...imageData,
     };
     currentImages.push(newImage);
+
+    console.log('latest curr image', currentImages);
     imageCache.set(finalDataURL, finalDataURL);
 
     // Re-render timeline
@@ -539,17 +573,22 @@ async function analyzeImagePlacement(token, afterImageDataURL, objectToSearch) {
 
 // Zoom + scroll image navigation
 let virtualScroll = 0;
+let isSwitching = false; // flag to prevent immediate zoom after image switch
+const switchCooldown = 300; // milliseconds
 
 window.addEventListener(
   'wheel',
   (e) => {
     e.preventDefault(); // prevent default scrolling
 
+    if (isSwitching) return; // ignore scroll during cooldown
     if (currentImgIdx < 0 || currentImgIdx >= currentImages.length) return;
     if (!currentImages[currentImgIdx].placement) return;
 
     // accumulate delta
     virtualScroll += e.deltaY;
+
+    const viewer = $('viewer');
 
     // --- zoom (always applied) ---
     img.style.transform = `scale(${1 + Math.max(0, virtualScroll) * 0.001})`;
@@ -560,22 +599,37 @@ window.addEventListener(
       '%';
 
     // --- navigation (only when threshold reached) ---
-    if (virtualScroll < -100) {
+    if (virtualScroll < -600) {
       // scroll down → next image
       if (currentImgIdx < currentImages.length - 1) {
         currentImgIdx++;
         img.src = currentImages[currentImgIdx].dataURL;
       }
-      virtualScroll = 0; // reset after changing image
+      virtualScroll = 0;
       img.style.transform = 'scale(1)';
-    } else if (virtualScroll > 400) {
+
+      // cooldown to prevent immediate zoom
+      isSwitching = true;
+      setTimeout(() => {
+        isSwitching = false;
+      }, switchCooldown);
+    } else if (virtualScroll > 600) {
+      viewer.style.cursor = 'zoom-out';
+
       // scroll up → previous image
       if (currentImgIdx > 0) {
+        viewer.style.cursor = 'zoom-out';
         currentImgIdx--;
         img.src = currentImages[currentImgIdx].dataURL;
       }
-      virtualScroll = 0; // reset after changing image
+      virtualScroll = 0;
       img.style.transform = 'scale(1)';
+
+      // cooldown to prevent immediate zoom
+      isSwitching = true;
+      setTimeout(() => {
+        isSwitching = false;
+      }, switchCooldown);
     }
   },
   { passive: false },
@@ -604,6 +658,9 @@ document.addEventListener('mousemove', (e) => {
 // Event listeners
 document.addEventListener('DOMContentLoaded', () => {
   console.log('DOM loaded, initializing...');
+
+  // hide loading
+  hideLoading();
 
   // Auto-initialize Firebase
   initializeFirebase();
@@ -647,39 +704,58 @@ document.addEventListener('DOMContentLoaded', () => {
 async function fetchWikimediaImagesWithBacklinks(
   keyword,
   maxDepth = 3, // limit the number of recursion
-  visited = new Set(),
+  articleId,
 ) {
   if (!keyword) return;
   // visited.add(keyword); // todo: check visited to avoid cycles
 
   // Step 1: Get the first image from the main page
-  console.log('Fetching image for pageeeee:', keyword);
-  await fetchFirstImageFromPage(keyword);
+  await fetchFirstImageFromPage(keyword, articleId);
 
   // Step 2: Get backlinks for this page
-  const backlinksUrl = `https://en.wikipedia.org/w/api.php?origin=*&action=query&list=backlinks&bltitle=${encodeURIComponent(
+  // Wikipedia Tool: What Links Here
+  const backlinksUrl = `https://en.wikipedia.org/w/api.php?action=query&prop=linkshere&titles=${encodeURIComponent(
     keyword,
-  )}&bllimit=1&format=json`;
+  )}&lhlimit=1&format=json&origin=*`;
 
+  let backlink;
+  // {
+  // ns:
+  // title:
+  // pageid:
+  // }
   try {
     const resp = await fetch(backlinksUrl);
     const data = await resp.json();
-    const backlink = data.query?.backlinks[0] || null; // take the first backlink
+
+    backlink = Object.values(data.query?.pages)[0].linkshere[0] || null; // take the first [links here]
+
+    if (!backlink || backlink.length === 0) return;
 
     if (wikiImages.length > maxDepth) return;
     const title = backlink?.title || null;
     if (title) {
       // recursively fetch images from backlinks
-      await fetchWikimediaImagesWithBacklinks(title);
+      await fetchWikimediaImagesWithBacklinks(title, 3, backlink.pageid);
     }
+
+    return backlink;
   } catch (err) {
     console.error('Error fetching backlinks for', keyword, err);
   }
 }
 
 // Helper: fetch the first valid image from a Wikipedia page
-async function fetchFirstImageFromPage(pageTitle) {
+async function fetchFirstImageFromPage(pageTitle, articleId) {
   console.log('Fetching first image for page:', pageTitle);
+
+  let fixArticleId;
+  if (!articleId) {
+    const { articleInfo } = await getWikipediaArticleInfo(pageTitle);
+    if (fixArticleId) {
+      fixArticleId = articleInfo.title;
+    }
+  }
 
   const imagesUrl = `https://en.wikipedia.org/w/api.php?origin=*&action=query&titles=${encodeURIComponent(
     pageTitle,
@@ -705,10 +781,11 @@ async function fetchFirstImageFromPage(pageTitle) {
 
         if (imageUrl && imageUrl.match(/\.(jpg|jpeg|png|gif|bmp|webp)$/i)) {
           wikiImages.push({
+            articleId: articleId || fixArticleId,
             title: pageTitle,
             url: imageUrl,
           });
-          console.log('Found image:', imageUrl);
+          console.log('Found image:', wikiImages);
           break; // Stop after first usable image
         }
       } catch (err) {
@@ -723,7 +800,6 @@ async function fetchFirstImageFromPage(pageTitle) {
 // Example usage with a search input
 const searchInput = document.getElementById('searchKeyword');
 const searchBtn = document.getElementById('searchBtn');
-const resultImg = document.getElementById('resultImage');
 
 searchBtn.addEventListener('click', async () => {
   let keyword = searchInput.value.trim();
@@ -733,6 +809,9 @@ searchBtn.addEventListener('click', async () => {
   await set(ref(database, 'images'), null);
   wikiImages = [];
   currentImages = [];
+
+  // Return the first image (keyword)
+  // await fetchFirstImageFromPage(keyword);
 
   // GET ALL RECURSED BACKLINKS
   await fetchWikimediaImagesWithBacklinks(keyword); // this fn saves the result to wikiImages global var
@@ -760,3 +839,50 @@ async function imageUrlToBase64(url) {
     reader.readAsDataURL(blob);
   });
 }
+
+async function getWikipediaArticleInfo(keyword) {
+  const url = `https://en.wikipedia.org/w/api.php?action=query&titles=${encodeURIComponent(
+    keyword,
+  )}&format=json&origin=*`;
+
+  try {
+    const response = await fetch(url);
+    const data = await response.json();
+
+    const pages = data.query.pages;
+    const pageId = Object.keys(pages)[0]; // page ID as string
+    const pageTitle = pages[pageId].title;
+
+    console.log(
+      'Fetched Wikipedia page ID:',
+      pageId,
+      'Title:',
+      pageTitle,
+      pages,
+    );
+
+    if (pageId === '-1') return null; // page does not exist
+
+    return { id: pageId, title: pageTitle };
+  } catch (err) {
+    console.error('Error fetching Wikipedia page ID:', err);
+    return null;
+  }
+}
+
+// Reset image, display viewr none
+const timeline = $('timeline');
+timeline.addEventListener('click', (e) => {
+  // If the click is on #timeline itself or anything that is NOT .image-item or img
+  if (!e.target.closest('.image-item')) {
+    const viewerImg = $('mainImage');
+    if (viewerImg) {
+      viewerImg.style.display = 'none';
+    }
+
+    const bbox = $('bbox');
+    if (bbox) bbox.style.display = 'none';
+
+    currentImgIdx = -1; // reset current image index
+  }
+});
