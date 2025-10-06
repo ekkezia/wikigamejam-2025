@@ -1,14 +1,3 @@
-import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.4.0/firebase-app.js';
-import {
-  getDatabase,
-  ref,
-  get,
-  set,
-  push,
-  orderByKey,
-  query,
-} from 'https://www.gstatic.com/firebasejs/10.4.0/firebase-database.js';
-
 // Constants
 const TOKEN_KEY = 'replicateApiToken';
 const REPLICATE_PROXY =
@@ -29,7 +18,6 @@ const firebaseConfig = {
 // Global state
 let firebaseApp = null;
 let database = null;
-let imageCache = new Map();
 let currentImages = [];
 let currentImgIdx = -1;
 let wikiImages = [];
@@ -110,111 +98,67 @@ async function urlToDataURL(url) {
   }
 }
 
-// Initialize Firebase
-function initializeFirebase() {
-  try {
-    console.log('Initializing Firebase with hardcoded config...');
-    firebaseApp = initializeApp(firebaseConfig);
-    database = getDatabase(firebaseApp);
-
-    showStatus('Firebase initialized successfully!');
-    loadTimeline();
-
-    // Enable upload button
-    const uploadBtn = $('uploadImage');
-    if (uploadBtn) {
-      uploadBtn.disabled = false;
-    }
-
-    return true;
-  } catch (error) {
-    console.error('Firebase initialization error:', error);
-    showStatus('Firebase initialization failed: ' + error.message, 'error');
-    return false;
-  }
-}
-
-// Load existing timeline from Firebase
-async function loadTimeline() {
-  try {
-    const imagesRef = ref(database, 'images');
-    const snapshot = await get(imagesRef);
-    const images = snapshot.val() || {};
-
-    currentImages = Object.keys(images)
-      .map((key) => ({
-        id: key,
-        ...images[key],
-      }))
-      .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
-
-    renderTimeline();
-  } catch (error) {
-    console.error('Error loading timeline:', error);
-    showStatus('Error loading timeline: ' + error.message, 'error');
-  }
-}
-
 // Render timeline UI
-function renderTimeline() {
+async function renderTimeline() {
   const timeline = $('timeline');
 
   if (currentImages.length === 0) {
     console.log('No images, showing upload interface'); // Debug log
-  } else {
-    const timelineImgs = currentImages
-      .map(
-        (img, index) =>
-          `
-      <div class="image-item" data-index="${index}">
-        <img src="${img.dataURL}" alt="Image ${index + 1}" loading="lazy">
-        <div class="image-info">
-          ${
-            img.articleUrl
-              ? `<a href="https://en.wikipedia.org/?curid=${
-                  img.articleUrl
-                }" target="_blank">
-                  ${img.title} ${index !== currentImages.length - 1 ? '->' : ''}
-                </a>`
-              : `${img.title} ->`
-          }
-        </div>
-      </div>
-    `,
-      )
-      .join('');
-
-    // Use innerHTML to set all content at once (images + upload interface)
-    timeline.innerHTML = timelineImgs;
+    timeline.innerHTML = '<p>No images yet</p>';
+    return;
   }
 
-  // Logic to click the image and open in #viewer
+  const timelineImgs = await Promise.all(
+    currentImages.map(async (img, index) => {
+      const currImgUrl = await getWikimediaImageInfo(img.currImgUrl);
+
+      return `
+        <div class="image-item" data-index="${index}">
+          <img 
+            src="${img.generatedImgUrl || currImgUrl}" 
+            alt="Image ${index + 1}" 
+            loading="lazy"
+          >
+          <div class="image-info">
+            ${
+              img.generatedImgUrl
+                ? `<a href="https://en.wikipedia.org/?curid=${
+                    img.articleId
+                  }" target="_blank">
+                    ${img.title} ${
+                    index !== currentImages.length - 1 ? '->' : ''
+                  }
+                  </a>`
+                : `${img.title}${img.generatedImgUrl ? ' ->' : ''}`
+            }
+          </div>
+        </div>
+      `;
+    }),
+  );
+
+  // ✅ Join after awaiting
+  timeline.innerHTML = timelineImgs.join('');
+
+  // ✅ Add click and hover listeners after DOM content is created
   const imageItems = document.querySelectorAll('.image-item');
+
   imageItems.forEach((item) => {
-    item.addEventListener('click', () => {
+    item.addEventListener('click', async () => {
       const index = item.getAttribute('data-index');
       const imgData = currentImages[index];
       if (imgData) {
-        // update the currentImgIdx
         currentImgIdx = imgData.idx;
-        console.log('🔔 Clicked image index:', currentImgIdx);
-
-        renderImageInViewer(imgData);
+        await renderImageInViewer(imgData);
       }
     });
-  });
 
-  // Logic for mouseover for scrubbing
-  imageItems.forEach((item) => {
-    item.addEventListener('mouseover', () => {
+    item.addEventListener('mouseover', async () => {
       const index = item.getAttribute('data-index');
       const imgData = currentImages[index];
       if (imgData) {
-        // update the currentImgIdx
         currentImgIdx = imgData.idx;
-        console.log('🔔 Hovered image index:', currentImgIdx);
-
-        renderImageInViewer(imgData);
+        await renderImageInViewer(imgData);
       }
     });
   });
@@ -223,12 +167,16 @@ function renderTimeline() {
 // #viewer div render function
 const img = $('mainImage');
 const bbox = $('bbox');
-function renderImageInViewer(imgData) {
+async function renderImageInViewer(imgData) {
   // display img
   img.style.display = 'block';
 
   // load image
-  img.src = imgData.dataURL;
+  let currImgUrl;
+  if (!imgData.generatedImgUrl) {
+    currImgUrl = await getWikimediaImageInfo(imgData.currImgUrl);
+  }
+  img.src = imgData.generatedImgUrl || currImgUrl;
 
   // update current image
   currentImgIdx = imgData.idx;
@@ -273,16 +221,17 @@ async function callReplicateModel(token, modelVersion, inputObj) {
   return await response.json();
 }
 
+// [STEP 2] Process image with Seedream-4
 // Process image with Seedream-4
-async function processWithSeedream(token, newImageDataURL, lastImageDataURL) {
+async function processWithSeedream(token, newImageBase64, lastImageBase64) {
   const input = {
     size: '2K',
     width: 2048,
     height: 2048,
     prompt:
-      'Insert seamlessly the first image inside the second image by placing it in a way that is seamless to the environment. However, try not to make the second object be overlapping the first object and so on.',
+      'Insert seamlessly the second image in the array inside the first image in the array by placing it in a way that is seamless to the environment. However, try not to make the second object be overlapping the first object and so on.',
     max_images: 4,
-    image_input: [lastImageDataURL, newImageDataURL],
+    image_input: [newImageBase64, lastImageBase64],
     aspect_ratio: '4:3',
     sequential_image_generation: 'auto',
   };
@@ -302,6 +251,7 @@ async function processWithSeedream(token, newImageDataURL, lastImageDataURL) {
 }
 
 // STEP 2: Save image data to Firebase Realtime Database
+// TODO: change to local storage
 async function saveImageToDatabase(imageData) {
   const imagesRef = ref(database, 'images');
   const newImageRef = push(imagesRef);
@@ -310,8 +260,8 @@ async function saveImageToDatabase(imageData) {
 }
 
 // Main upload handler
-async function handleImageUpload(currImg, objectToSearch) {
-  console.log('🎊 uploading image for ', currImg, objectToSearch);
+async function handleImageUpload(currImg, prevImg = null) {
+  console.log('🎊 uploading image for ', currImg, prevImg);
   if (!currImg) {
     return;
   }
@@ -322,17 +272,40 @@ async function handleImageUpload(currImg, objectToSearch) {
     return;
   }
 
-  if (!database) {
-    showStatus('Firebase not initialized', 'error');
-    return;
+  let isGenerated;
+  let placement;
+  let generatedImgUrl;
+
+  // if it is first image
+  if (!prevImg && currImg) {
+    console.log('FIRST', currImg);
+    const imageData = {
+      idx: 0,
+      title: currImg.title, // local currImg has { title, pageid, ns }
+      generatedImgUrl: null, // the generated result that is rendered
+      currImgUrl: currImg.url, // the object that is just added (the object that is fed to the model to be generated) // File: ...
+      prevImgUrl: null,
+      placement: null,
+      articleUrl: `https://en.wikipedia.org/?curid=${currImg.pageid}`,
+      timestamp: Date.now(),
+      isGenerated: isGenerated,
+      width: 2048,
+      height: 2048,
+    };
+
+    console.log('---Saving to database...---', imageData);
+    showStatus('Saving to database...', 'success');
+
+    await saveImageToLocal(imageData);
+
+    // Add to current images and cache
+    const newImage = {
+      ...imageData,
+    };
+    currentImages.push(newImage);
   }
 
-  let finalDataURL;
-  let isGenerated;
-  let originalDataURL;
-  let placement;
-  let objectToSearchURL;
-
+  if (!prevImg) return;
   try {
     // show which image is being processed (use filename if available)
     const displayName = currImg.title || currImg.url;
@@ -341,55 +314,49 @@ async function handleImageUpload(currImg, objectToSearch) {
 
     const timestamp = new Date().toISOString();
 
-    // Convert file to base64 data URL
-    console.log('Converting image to base64...', currImg, objectToSearch);
-    originalDataURL = await imageUrlToBase64(currImg.url);
-    if (objectToSearch)
-      objectToSearchURL = await imageUrlToBase64(objectToSearch.url);
+    const resolvedCurrImg = await getWikimediaImageInfo(currImg.url);
+    const resolvedCurrImgBase64 = await imageUrlToBase64(resolvedCurrImg);
 
-    console.log('Base64 conversion complete');
+    const resolvedPrevImg = await getWikimediaImageInfo(prevImg.url);
+    const resolvedPrevImgBase64 = await imageUrlToBase64(resolvedPrevImg);
 
-    finalDataURL = originalDataURL;
     isGenerated = false;
 
     //////////////////////////////////////////////////////////////
-    // If this is not the first image and , process with Seedream-4
-    if (currentImages.length > 0 && objectToSearchURL) {
-      const lastImage = currentImages[currentImages.length - 1];
-      console.log('Processing with Seedream-4...');
+    // If this is not the first image (prevImg EXISTS) , process with Seedream-4
+    if (prevImg) {
+      console.log('---Processing with Seedream-4...---');
 
       try {
         showStatus('Processing with Seedream-4 model...', 'success');
 
         // For Seedream, we might need to use the original data URL directly
         // or convert it to a temporary URL that Replicate can access
-        const generatedUrl = await processWithSeedream(
+        const res = await processWithSeedream(
           token,
-          originalDataURL,
-          lastImage.dataURL,
+          resolvedCurrImgBase64,
+          resolvedPrevImgBase64,
         );
-
-        // render original data url and last image url as image on frontend cuz i wanna check if the generated image is correct
-        // create the img element
-        console.log('imageee', originalDataURL, lastImage);
+        console.log('generated', generatedImgUrl);
 
         // Convert the generated URL back to base64 for storage
-        console.log('Converting generated image to base64...');
-        finalDataURL = await urlToDataURL(generatedUrl);
+        console.log('---Converting generated image to base64...---');
+
+        generatedImgUrl = res;
+        console.log('gen', res);
+
         isGenerated = true;
 
-        console.log('🌙 [SEEDREAM] Generated image converted to base64!');
+        console.log('---🌙 [SEEDREAM] Generated image converted to base64!---');
 
-        // STEP 3: analyze image difference to find the new object estimated location / bbox
+        // STEP 3: analyze image difference to find within the curr object (prevImgBase64) in the new object (the generated image is the new object) estimated location / bbox
+        let generatedImgBase64 = await imageUrlToBase64(generatedImgUrl);
         placement = await analyzeImagePlacement(
           token,
-          finalDataURL,
-          objectToSearchURL,
+          generatedImgBase64,
+          resolvedPrevImgBase64,
         );
         console.log('🎆 Image placement analysis:', placement);
-
-        // break workflow if no final data URL of converted image found and the db already have images
-        if (!finalDataURL && currentImages.length !== 0) return;
       } catch (error) {
         console.error('Seedream processing error:', error);
         showStatus(
@@ -400,36 +367,34 @@ async function handleImageUpload(currImg, objectToSearch) {
     }
 
     // can skip here if its first image
-
     // STEP 5: Save to database
+    console.log('Image Name:', currImg, prevImg);
     const imageData = {
       idx: currentImages.length === 0 ? 0 : currentImages.length,
-      title: currImg.title,
-      articleUrl: currImg.articleId || null,
-      dataURL: finalDataURL,
-      originalDataURL: originalDataURL,
-      wikiDataUrl: objectToSearchURL || null,
+      title: currImg.title, // local currImg has { title, pageid, ns }
+      generatedImgUrl: generatedImgUrl || null, // the generated result that is rendered
+      currImgUrl: currImg.url, // the object that is just added (the object that is fed to the model to be generated) // File: ...
+      prevImgUrl: prevImg.url || null,
       placement: placement || null,
+      articleUrl: `https://en.wikipedia.org/?curid=${currImg.pageid}`,
       timestamp: timestamp,
       isGenerated: isGenerated,
       width: 2048,
       height: 2048,
     };
 
-    console.log('Saving to database...', imageData);
+    console.log('---Saving to database...---', imageData);
     showStatus('Saving to database...', 'success');
 
-    await saveImageToDatabase(imageData);
+    await saveImageToLocal(imageData);
 
     // Add to current images and cache
     const newImage = {
-      id: Date.now().toString(),
       ...imageData,
     };
     currentImages.push(newImage);
 
     console.log('latest curr image', currentImages);
-    imageCache.set(finalDataURL, finalDataURL);
 
     // Re-render timeline
     renderTimeline();
@@ -443,12 +408,17 @@ async function handleImageUpload(currImg, objectToSearch) {
 }
 
 // STEP 3: analyze image difference to find the new object estimated location / bbox
+// object to search should be the prevImgBase64
 // Function to analyze image placement using GPT-4V
-async function analyzeImagePlacement(token, afterImageDataURL, objectToSearch) {
-  console.log('🔍 Starting image placement analysis...');
+async function analyzeImagePlacement(
+  token,
+  generatedImgBase64,
+  objectToSearch,
+) {
+  console.log('---🔍 Starting image placement analysis...---');
 
   const prompt = `
-      I have 3 images:
+      I have 2 images:
     1. AFTER or the second image in the image_input array: The result after inserting the new image into the original composite image.
     2. The object to be searched that was submitted from wikipedia result prior to the current image generation.
 
@@ -478,7 +448,7 @@ async function analyzeImagePlacement(token, afterImageDataURL, objectToSearch) {
         model: 'openai/gpt-5',
         input: {
           prompt: prompt,
-          image_input: [afterImageDataURL, objectToSearch],
+          image_input: [generatedImgBase64, objectToSearch],
         },
       }),
     });
@@ -578,7 +548,7 @@ const switchCooldown = 300; // milliseconds
 
 window.addEventListener(
   'wheel',
-  (e) => {
+  async (e) => {
     e.preventDefault(); // prevent default scrolling
 
     if (isSwitching) return; // ignore scroll during cooldown
@@ -590,6 +560,8 @@ window.addEventListener(
 
     const viewer = $('viewer');
 
+    const currImgUrl = await getWikimediaImageInfo(img.currImgUrl);
+
     // --- zoom (always applied) ---
     img.style.transform = `scale(${1 + Math.max(0, virtualScroll) * 0.001})`;
     img.style.transformOrigin =
@@ -599,11 +571,11 @@ window.addEventListener(
       '%';
 
     // --- navigation (only when threshold reached) ---
-    if (virtualScroll < -600) {
+    if (virtualScroll < -2000) {
       // scroll down → next image
       if (currentImgIdx < currentImages.length - 1) {
         currentImgIdx++;
-        img.src = currentImages[currentImgIdx].dataURL;
+        img.src = currentImages[currentImgIdx].generatedImgUrl || currImgUrl;
       }
       virtualScroll = 0;
       img.style.transform = 'scale(1)';
@@ -613,14 +585,14 @@ window.addEventListener(
       setTimeout(() => {
         isSwitching = false;
       }, switchCooldown);
-    } else if (virtualScroll > 600) {
+    } else if (virtualScroll > 2000) {
       viewer.style.cursor = 'zoom-out';
 
       // scroll up → previous image
       if (currentImgIdx > 0) {
         viewer.style.cursor = 'zoom-out';
         currentImgIdx--;
-        img.src = currentImages[currentImgIdx].dataURL;
+        img.src = currentImages[currentImgIdx].generatedImgUrl || currImgUrl;
       }
       virtualScroll = 0;
       img.style.transform = 'scale(1)';
@@ -663,7 +635,8 @@ document.addEventListener('DOMContentLoaded', () => {
   hideLoading();
 
   // Auto-initialize Firebase
-  initializeFirebase();
+  // initializeFirebase();
+  initializeLocalStorage();
 
   // Button handlers for token management only
   const saveTokenBtn = $('saveToken');
@@ -700,20 +673,9 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 // WIKIPEDIA
-// WIKIPEDIA BACKLINKS
-async function fetchWikimediaImagesWithBacklinks(
-  keyword,
-  maxDepth = 3, // limit the number of recursion
-  articleId,
-) {
-  if (!keyword) return;
-  // visited.add(keyword); // todo: check visited to avoid cycles
-
-  // Step 1: Get the first image from the main page
-  await fetchFirstImageFromPage(keyword, articleId);
-
-  // Step 2: Get backlinks for this page
-  // Wikipedia Tool: What Links Here
+let selectedBacklinks = [];
+// [HELPER FOR STEP 1] to get backlink
+async function getBacklink(keyword) {
   const backlinksUrl = `https://en.wikipedia.org/w/api.php?action=query&prop=linkshere&titles=${encodeURIComponent(
     keyword,
   )}&lhlimit=1&format=json&origin=*`;
@@ -728,16 +690,23 @@ async function fetchWikimediaImagesWithBacklinks(
     const resp = await fetch(backlinksUrl);
     const data = await resp.json();
 
-    backlink = Object.values(data.query?.pages)[0].linkshere[0] || null; // take the first [links here]
+    let selectedIndex = 0;
+
+    // TODO
+    // check thru selected backlinks if any of the backlink result is duplicating with the current backlink[0]
+    // const backlinkId = Object.values(data.query?.pages)[0].pageid;
+    // // If found duplicate,check the next backlink
+    // if (selectedBacklinks.indexOf((b) => b.id === backlinkId) !== -1) {
+    //   selectedIndex++;
+    // }
+
+    const randomIdx = Math.floor(
+      Math.random() * Object.values(data.query?.pages).length,
+    );
+
+    backlink = Object.values(data.query?.pages)[randomIdx].linkshere[0] || null; // take the first [links here]
 
     if (!backlink || backlink.length === 0) return;
-
-    if (wikiImages.length > maxDepth) return;
-    const title = backlink?.title || null;
-    if (title) {
-      // recursively fetch images from backlinks
-      await fetchWikimediaImagesWithBacklinks(title, 3, backlink.pageid);
-    }
 
     return backlink;
   } catch (err) {
@@ -745,55 +714,82 @@ async function fetchWikimediaImagesWithBacklinks(
   }
 }
 
-// Helper: fetch the first valid image from a Wikipedia page
-async function fetchFirstImageFromPage(pageTitle, articleId) {
-  console.log('Fetching first image for page:', pageTitle);
+// [STEP 1] Gather Wikipedia Images first via backlinks
+async function fetchWikimediaImagesWithBacklinks(
+  keyword,
+  maxDepth = 4, // limit the number of recursion
+) {
+  if (wikiImages.length > maxDepth) return;
 
-  let fixArticleId;
-  if (!articleId) {
-    const { articleInfo } = await getWikipediaArticleInfo(pageTitle);
-    if (fixArticleId) {
-      fixArticleId = articleInfo.title;
-    }
+  if (!keyword) return;
+
+  // Step 1: Get all recursive backlinks for this keyword
+  for (let i = 0; i < maxDepth; i++) {
+    let backlinkData;
+    if (selectedBacklinks.length === 0) backlinkData = keyword;
+    else backlinkData = selectedBacklinks[selectedBacklinks.length - 1];
+    const backlink = await getBacklink(backlinkData.title || keyword);
+    selectedBacklinks.push(backlink);
   }
 
-  const imagesUrl = `https://en.wikipedia.org/w/api.php?origin=*&action=query&titles=${encodeURIComponent(
-    pageTitle,
+  // Step 2: insert the first keyword page itself too
+  const firstPage = await getWikipediaArticleInfo(keyword);
+  if (firstPage) selectedBacklinks.unshift(firstPage);
+
+  console.log('selectedBacklinks:', selectedBacklinks);
+  // Step 3: Get the images associated with them from Wikimedia Commons
+  for (const backlink of selectedBacklinks) {
+    await fetchFirstImageFromPage(backlink);
+  }
+}
+
+// Helper for [STEP 1]: fetch the first valid image from a Wikipedia page
+async function fetchFirstImageFromPage(backlink) {
+  console.log('Fetching first image for page:', backlink);
+
+  const imagesUrl = `https://en.wikipedia.org/w/api.php?origin=*&action=query&pageids=${encodeURIComponent(
+    backlink.pageid,
   )}&prop=images&format=json`;
 
   try {
     const imagesResp = await fetch(imagesUrl);
     const imagesData = await imagesResp.json();
-    const pages = Object.values(imagesData.query.pages);
-    if (!pages.length || !pages[0].images) return;
+    const page = Object.values(imagesData.query.pages)[0];
+    //File:2017 Wahlkampf-Tour- Oberösterreich (37342740665).jpg"
 
-    // Loop through all images until we find a usable one
-    for (const img of pages[0].images) {
-      const infoUrl = `https://en.wikipedia.org/w/api.php?origin=*&action=query&titles=${encodeURIComponent(
-        img.title,
-      )}&prop=imageinfo&iiprop=url&format=json`;
+    const allImages = page.images || [];
 
-      try {
-        const resp = await fetch(infoUrl);
-        const data = await resp.json();
-        const imgPages = Object.values(data.query.pages);
-        const imageUrl = imgPages[0]?.imageinfo?.[0]?.url;
+    // ✅ Only keep valid image file extensions
+    const validExtensions = [
+      '.jpg',
+      '.jpeg',
+      '.png',
+      '.gif',
+      '.tiff',
+      '.bmp',
+      '.webp',
+    ];
+    const filteredImages = allImages.filter((img) => {
+      const title = img.title.toLowerCase();
+      return validExtensions.some((ext) => title.endsWith(ext));
+    });
 
-        if (imageUrl && imageUrl.match(/\.(jpg|jpeg|png|gif|bmp|webp)$/i)) {
-          wikiImages.push({
-            articleId: articleId || fixArticleId,
-            title: pageTitle,
-            url: imageUrl,
-          });
-          console.log('Found image:', wikiImages);
-          break; // Stop after first usable image
-        }
-      } catch (err) {
-        console.warn('Failed to get image info for', img.title, err);
-      }
+    if (filteredImages.length === 0) {
+      console.warn(`No valid image files found for page: ${backlink.title}`);
+      return;
     }
+
+    // ✅ Pick a random image from filtered list
+    const randomImg =
+      filteredImages[Math.floor(Math.random() * filteredImages.length)];
+
+    wikiImages.push({
+      pageid: backlink.pageid,
+      title: backlink.title,
+      url: randomImg.title, // e.g., "File:Example.jpg"
+    });
   } catch (err) {
-    console.warn('Failed to get images from page', pageTitle, err);
+    console.warn('Failed to get images from page', backlink, err);
   }
 }
 
@@ -806,9 +802,10 @@ searchBtn.addEventListener('click', async () => {
   if (!keyword) return;
 
   // clear old data first
-  await set(ref(database, 'images'), null);
+  clearLocalImages();
   wikiImages = [];
   currentImages = [];
+  selectedBacklinks = [];
 
   // Return the first image (keyword)
   // await fetchFirstImageFromPage(keyword);
@@ -853,17 +850,9 @@ async function getWikipediaArticleInfo(keyword) {
     const pageId = Object.keys(pages)[0]; // page ID as string
     const pageTitle = pages[pageId].title;
 
-    console.log(
-      'Fetched Wikipedia page ID:',
-      pageId,
-      'Title:',
-      pageTitle,
-      pages,
-    );
-
     if (pageId === '-1') return null; // page does not exist
 
-    return { id: pageId, title: pageTitle };
+    return { pageid: parseInt(pageId), title: pageTitle };
   } catch (err) {
     console.error('Error fetching Wikipedia page ID:', err);
     return null;
@@ -886,3 +875,52 @@ timeline.addEventListener('click', (e) => {
     currentImgIdx = -1; // reset current image index
   }
 });
+
+async function getWikimediaImageInfo(fileTitle) {
+  try {
+    const res = await fetch(
+      `https://en.wikipedia.org/w/api.php?action=query&titles=${encodeURIComponent(
+        fileTitle,
+      )}&prop=imageinfo&iiprop=url&format=json&origin=*`,
+    );
+    const data = await res.json();
+    const imgUrl = Object.values(data.query.pages)[0].imageinfo[0].url; // File: ...
+
+    return imgUrl;
+  } catch (error) {
+    console.error('Error fetching Wikimedia image info:', error);
+  }
+}
+
+// Initialize "local database" using localStorage
+function initializeLocalStorage() {
+  showStatus('Using local storage for persistence.');
+  loadTimelineFromLocal();
+  const uploadBtn = $('uploadImage');
+  if (uploadBtn) uploadBtn.disabled = false;
+  return true;
+}
+
+// Save an image to localStorage
+async function saveImageToLocal(imageData) {
+  const existing = JSON.parse(localStorage.getItem('images') || '[]');
+  existing.push(imageData);
+  localStorage.setItem('images', JSON.stringify(existing));
+  return true;
+}
+
+// Load timeline images from localStorage
+async function loadTimelineFromLocal() {
+  const stored = JSON.parse(localStorage.getItem('images') || '[]');
+  currentImages = stored.sort(
+    (a, b) => new Date(a.timestamp) - new Date(b.timestamp),
+  );
+  renderTimeline();
+}
+
+// Clear images from localStorage
+function clearLocalImages() {
+  localStorage.removeItem('images');
+  currentImages = [];
+  renderTimeline();
+}
