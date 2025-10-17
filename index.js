@@ -4,17 +4,6 @@ const REPLICATE_PROXY =
   'https://itp-ima-replicate-proxy.web.app/api/create_n_get';
 const SEEDREAM_MODEL = 'bytedance/seedream-4';
 
-// Hardcoded Firebase config
-const firebaseConfig = {
-  apiKey: 'AIzaSyB3NIp4zg94-XxVOUkdnl-w1oYZ_Qo32Lw',
-  authDomain: 'pipipip-c1210.firebaseapp.com',
-  databaseURL: 'https://pipipip-c1210-default-rtdb.firebaseio.com/',
-  projectId: 'pipipip-c1210',
-  messagingSenderId: '431347949307',
-  appId: '1:431347949307:web:a83ba36b06e6db73041a5e',
-  measurementId: 'G-4HP4GMTH2W',
-};
-
 // Global state
 let firebaseApp = null;
 let database = null;
@@ -171,8 +160,18 @@ async function renderImageInViewer(imgData) {
   // display img
   img.style.display = 'block';
 
-  // load image
+  console.log('infoooo', imgData);
+
   let currImgUrl;
+
+  if (imgData.idx === 0) {
+    const info = await getWikimediaImageInfo(imgData.currImgUrl);
+    const b64 = await imageUrlToBase64(info);
+    console.log('info', b64);
+    currImgUrl = b64;
+  }
+
+  // load image
   if (!imgData.generatedImgUrl) {
     currImgUrl = await getWikimediaImageInfo(imgData.currImgUrl);
   }
@@ -223,15 +222,29 @@ async function callReplicateModel(token, modelVersion, inputObj) {
 
 // [STEP 2] Process image with Seedream-4
 // Process image with Seedream-4
-async function processWithSeedream(token, newImageBase64, lastImageBase64) {
+async function processWithSeedream(token, newImageDataURL, lastImageDataURL) {
+  // console.log('starting Seedream process: last', lastImageDataURL);
+  // console.log('starting Seedream process: new', newImageDataURL);
+
+  if (!newImageDataURL || !lastImageDataURL) {
+    throw new Error('Both newImageDataURL and lastImageDataURL are required');
+  }
+
   const input = {
     size: '2K',
     width: 2048,
     height: 2048,
-    prompt:
-      'Insert seamlessly the second image in the array inside the first image in the array by placing it in a way that is seamless to the environment. However, try not to make the second object be overlapping the first object and so on.',
+    prompt: `
+      Create a Droste-style image where the first image in the array appears as a smaller poster within the second image in the array.
+      Keep the entire composition and all objects of the second image exactly in the same place — do not rearrange or distort them.
+      The second image should remain fully visible and unchanged, serving as the main background.
+      Place the first image inside it as a smaller printed poster, painting, or framed image that looks naturally integrated into the scene.
+      The first image should appear smaller and contained within the second image, preserving the perspective and lighting of the second image.
+      Do not modify or move any subjects or elements of the second image — just overlay the first image inside it.
+      Ensure the entire frame is filled with the second image, with the first image clearly visible inside it, like a poster within a poster.
+      `,
     max_images: 4,
-    image_input: [newImageBase64, lastImageBase64],
+    image_input: [lastImageDataURL, newImageDataURL],
     aspect_ratio: '4:3',
     sequential_image_generation: 'auto',
   };
@@ -251,20 +264,9 @@ async function processWithSeedream(token, newImageBase64, lastImageBase64) {
 }
 
 // STEP 2: Save image data to Firebase Realtime Database
-// TODO: change to local storage
-async function saveImageToDatabase(imageData) {
-  const imagesRef = ref(database, 'images');
-  const newImageRef = push(imagesRef);
-  await set(newImageRef, imageData);
-  return newImageRef.key;
-}
-
 // Main upload handler
-async function handleImageUpload(currImg, prevImg = null) {
-  console.log('🎊 uploading image for ', currImg, prevImg);
-  if (!currImg) {
-    return;
-  }
+async function handleImageUpload(currImg, prevImg = null, idx) {
+  if (!currImg) return;
 
   const token = localStorage.getItem(TOKEN_KEY);
   if (!token) {
@@ -278,13 +280,12 @@ async function handleImageUpload(currImg, prevImg = null) {
 
   // if it is first image
   if (!prevImg && currImg) {
-    console.log('FIRST', currImg);
     const imageData = {
       idx: 0,
       title: currImg.title, // local currImg has { title, pageid, ns }
-      generatedImgUrl: null, // the generated result that is rendered
+      generatedImgUrl: null, // does not exist yet
       currImgUrl: currImg.url, // the object that is just added (the object that is fed to the model to be generated) // File: ...
-      prevImgUrl: null,
+      prevImgUrl: null, // does not exist yet
       placement: null,
       articleUrl: `https://en.wikipedia.org/?curid=${currImg.pageid}`,
       timestamp: Date.now(),
@@ -293,7 +294,7 @@ async function handleImageUpload(currImg, prevImg = null) {
       height: 2048,
     };
 
-    console.log('---Saving to database...---', imageData);
+    console.log('---[FIRST] Saving to database...---', imageData);
     showStatus('Saving to database...', 'success');
 
     await saveImageToLocal(imageData);
@@ -305,7 +306,7 @@ async function handleImageUpload(currImg, prevImg = null) {
     currentImages.push(newImage);
   }
 
-  if (!prevImg) return;
+  // If this is not the first image, process with Seedream-4
   try {
     // show which image is being processed (use filename if available)
     const displayName = currImg.title || currImg.url;
@@ -314,36 +315,56 @@ async function handleImageUpload(currImg, prevImg = null) {
 
     const timestamp = new Date().toISOString();
 
-    const resolvedCurrImg = await getWikimediaImageInfo(currImg.url);
-    const resolvedCurrImgBase64 = await imageUrlToBase64(resolvedCurrImg);
+    const lastImage = currentImages[currentImages.length - 1];
+    const lastImageUrl = lastImage.generatedImgUrl || lastImage.currImgUrl; // fallback if it is the SEED image
 
-    const resolvedPrevImg = await getWikimediaImageInfo(prevImg.url);
-    const resolvedPrevImgBase64 = await imageUrlToBase64(resolvedPrevImg);
+    const resolvedCurrImgUrl = await getWikimediaImageInfo(currImg.url);
+    const resolvedCurrImgBase64 = await imageUrlToBase64(resolvedCurrImgUrl);
+
+    // let previousGeneratedImg =
+    const resolvedPrevImgUrl = await getWikimediaImageInfo(prevImg.url);
+    const resolvedPrevImgBase64 = await imageUrlToBase64(resolvedPrevImgUrl);
+
+    // only resolve if the last image is the SEED image because they're not generated and still in the form of File: ... from wiki
+
+    let resolvedLastGeneratedImgUrl, resolvedLastGeneratedImgBase64;
+
+    // address if this current processing is for the third image or beyond
+    if (idx < 2) {
+      // console.log('last image url', lastImageUrl);
+      // If it's the third image or beyond, use the generated image URL
+      resolvedLastGeneratedImgUrl = await getWikimediaImageInfo(lastImageUrl);
+      resolvedLastGeneratedImgBase64 = await imageUrlToBase64(
+        resolvedLastGeneratedImgUrl,
+      );
+    } else {
+      resolvedLastGeneratedImgUrl = lastImage.generatedImgUrl;
+      resolvedLastGeneratedImgBase64 = await imageUrlToBase64(
+        resolvedLastGeneratedImgUrl,
+      );
+      // console.log('go here!', resolvedLastGeneratedImgUrl);
+    }
 
     isGenerated = false;
 
     //////////////////////////////////////////////////////////////
     // If this is not the first image (prevImg EXISTS) , process with Seedream-4
     if (prevImg) {
-      console.log('---Processing with Seedream-4...---');
-
       try {
-        showStatus('Processing with Seedream-4 model...', 'success');
-
+        showStatus('Processing with Seedream-4 model...');
+        console.log('processing with last image', resolvedLastGeneratedImgUrl);
         // For Seedream, we might need to use the original data URL directly
         // or convert it to a temporary URL that Replicate can access
         const res = await processWithSeedream(
           token,
           resolvedCurrImgBase64,
-          resolvedPrevImgBase64,
+          resolvedLastGeneratedImgBase64,
         );
-        console.log('generated', generatedImgUrl);
 
         // Convert the generated URL back to base64 for storage
         console.log('---Converting generated image to base64...---');
-
+        console.log('ressss', res);
         generatedImgUrl = res;
-        console.log('gen', res);
 
         isGenerated = true;
 
@@ -353,8 +374,8 @@ async function handleImageUpload(currImg, prevImg = null) {
         let generatedImgBase64 = await imageUrlToBase64(generatedImgUrl);
         placement = await analyzeImagePlacement(
           token,
+          resolvedLastGeneratedImgBase64,
           generatedImgBase64,
-          resolvedPrevImgBase64,
         );
         console.log('🎆 Image placement analysis:', placement);
       } catch (error) {
@@ -368,11 +389,10 @@ async function handleImageUpload(currImg, prevImg = null) {
 
     // can skip here if its first image
     // STEP 5: Save to database
-    console.log('Image Name:', currImg, prevImg);
     const imageData = {
       idx: currentImages.length === 0 ? 0 : currentImages.length,
       title: currImg.title, // local currImg has { title, pageid, ns }
-      generatedImgUrl: generatedImgUrl || null, // the generated result that is rendered
+      generatedImgUrl: generatedImgUrl, // the generated result that is rendered
       currImgUrl: currImg.url, // the object that is just added (the object that is fed to the model to be generated) // File: ...
       prevImgUrl: prevImg.url || null,
       placement: placement || null,
@@ -383,7 +403,7 @@ async function handleImageUpload(currImg, prevImg = null) {
       height: 2048,
     };
 
-    console.log('---Saving to database...---', imageData);
+    console.log('---[NOT FIRST] Saving to database...---', imageData);
     showStatus('Saving to database...', 'success');
 
     await saveImageToLocal(imageData);
@@ -412,17 +432,17 @@ async function handleImageUpload(currImg, prevImg = null) {
 // Function to analyze image placement using GPT-4V
 async function analyzeImagePlacement(
   token,
-  generatedImgBase64,
-  objectToSearch,
+  beforeImageMainCharDataURL, // the main character of the previous image, for example i just added a cat before the current image (even tho the previous image is a combination of cat and Monalisa)
+  afterImageDataURL,
 ) {
   console.log('---🔍 Starting image placement analysis...---');
 
   const prompt = `
       I have 2 images:
-    1. AFTER or the second image in the image_input array: The result after inserting the new image into the original composite image.
-    2. The object to be searched that was submitted from wikipedia result prior to the current image generation.
+    1. The BEFORE object or the first image in the image_input array to be searched that was submitted from wikipedia result prior to the current image generation. 
+    2. AFTER or the second image in the image_input array: The result after inserting the new image into the original composite image.
 
-    Please analyze where the object to be searched (which is the second image in the image_input array) is at within the AFTER image (which is the first image in the image_input array). Return ONLY a JSON object with the bounding box coordinates as percentages (0-100) of the image dimensions:
+    Please analyze where the object or image to be searched (which is the first image in the image_input array) is located at within the AFTER image (which is the second image in the image_input array). Return ONLY a JSON object with the bounding box coordinates as percentages (0-100) of the image dimensions:
 
     {
       "placement": {
@@ -448,7 +468,7 @@ async function analyzeImagePlacement(
         model: 'openai/gpt-5',
         input: {
           prompt: prompt,
-          image_input: [generatedImgBase64, objectToSearch],
+          image_input: [beforeImageMainCharDataURL, afterImageDataURL],
         },
       }),
     });
@@ -560,15 +580,21 @@ window.addEventListener(
 
     const viewer = $('viewer');
 
-    const currImgUrl = await getWikimediaImageInfo(img.currImgUrl);
+    const currImgUrl =
+      currentImgIdx === 0
+        ? img.currImgUrl
+        : await getWikimediaImageInfo(img.currImgUrl);
 
     // --- zoom (always applied) ---
     img.style.transform = `scale(${1 + Math.max(0, virtualScroll) * 0.001})`;
-    img.style.transformOrigin =
-      currentImages[currentImgIdx].placement.centerX +
-      '% ' +
-      currentImages[currentImgIdx].placement.centerY +
-      '%';
+
+    if (currentImages[currentImgIdx].placement) {
+      img.style.transformOrigin =
+        currentImages[currentImgIdx].placement.centerX +
+        '% ' +
+        currentImages[currentImgIdx].placement.centerY +
+        '%';
+    }
 
     // --- navigation (only when threshold reached) ---
     if (virtualScroll < -2000) {
@@ -717,7 +743,7 @@ async function getBacklink(keyword) {
 // [STEP 1] Gather Wikipedia Images first via backlinks
 async function fetchWikimediaImagesWithBacklinks(
   keyword,
-  maxDepth = 4, // limit the number of recursion
+  maxDepth = 3, // limit the number of recursion
 ) {
   if (wikiImages.length > maxDepth) return;
 
@@ -819,7 +845,38 @@ searchBtn.addEventListener('click', async () => {
       const prevImg = i === 0 ? null : wikiImages[i - 1];
       const currImg = wikiImages[i];
 
-      await handleImageUpload(currImg, prevImg);
+      await handleImageUpload(currImg, prevImg, i);
+    }
+  }
+});
+
+// ENTER click
+document.addEventListener('keydown', async (event) => {
+  // if ENTER key is pressed
+  if (event.key !== 'Enter') return;
+
+  let keyword = searchInput.value.trim();
+  if (!keyword) return;
+
+  // clear old data first
+  clearLocalImages();
+  wikiImages = [];
+  currentImages = [];
+  selectedBacklinks = [];
+
+  // Return the first image (keyword)
+  // await fetchFirstImageFromPage(keyword);
+
+  // GET ALL RECURSED BACKLINKS
+  await fetchWikimediaImagesWithBacklinks(keyword); // this fn saves the result to wikiImages global var
+
+  if (wikiImages.length > 0) {
+    // PROCESS IMAGES from the BACKLINKS
+    for (let i = 0; i < wikiImages.length; i++) {
+      const prevImg = i === 0 ? null : wikiImages[i - 1];
+      const currImg = wikiImages[i];
+
+      await handleImageUpload(currImg, prevImg, i);
     }
   }
 });
